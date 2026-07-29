@@ -1,0 +1,115 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <style>
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      max-width: 720px;
+      margin: 40px auto;
+      color: #222;
+      line-height: 1.6;
+    }
+    h2 {
+      color: #4b2e83;
+    }
+    #result h3 {
+      font-size: 20px;
+      font-weight: 700;
+      border-bottom: 2px solid #4b2e83;
+      padding-bottom: 6px;
+      margin-top: 28px;
+    }
+    #result ul {
+      padding-left: 22px;
+    }
+    #result li {
+      margin-bottom: 8px;
+    }
+    input[type="text"], input[type="file"] {
+      padding: 6px;
+      margin: 8px 0;
+    }
+    button {
+      background: #4b2e83;
+      color: white;
+      border: none;
+      padding: 10px 16px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 15px;
+    }
+    button:hover {
+      background: #3a2266;
+    }
+    #speakBtn {
+      background: #2e8354;
+    }
+    #speakBtn:hover {
+      background: #226640;
+    }
+  </style>
+</head>
+<body>
+  <h2>📚 Study Summarizer</h2>
+  <form id="uploadForm">
+    <input type="file" name="file" required><br>
+    <input type="text" name="language" value="Hindi"><br><br>
+    <button type="submit">Summarize</button>
+  </form>
+
+  <button id="speakBtn" style="display:none; margin-top:15px;">🔊 Listen to Summary</button>
+
+  <div id="result"></div>
+
+  <script>
+    let currentSummaryText = "";
+
+    document.getElementById("uploadForm").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const formData = new FormData(e.target);
+      document.getElementById("result").innerHTML = "Loading...";
+      document.getElementById("speakBtn").style.display = "none";
+
+      const res = await fetch("http://localhost:5000/process", {
+        method: "POST",
+        body: formData
+      });
+      const data = await res.json();
+
+      if (data.error) {
+        document.getElementById("result").innerHTML = "Error: " + data.error;
+        return;
+      }
+
+      let html = "<h3>" + data.headings.overview + "</h3><p>" + data.overview + "</p>";
+
+      html += "<h3>" + data.headings.key_points + "</h3><ul>";
+      data.key_points.forEach(point => {
+        html += "<li>" + point + "</li>";
+      });
+      html += "</ul>";
+
+      html += "<h3>" + data.headings.key_terms + "</h3><ul>";
+      data.key_terms.forEach(item => {
+        html += "<li><strong>" + item.term + "</strong>: " + item.definition + "</li>";
+      });
+      html += "</ul>";
+
+      document.getElementById("result").innerHTML = html;
+
+      currentSummaryText = data.overview + ". " +
+        data.key_points.join(". ") + ". " +
+        data.key_terms.map(t => t.term + ": " + t.definition).join(". ");
+
+      document.getElementById("speakBtn").style.display = "inline-block";
+    });
+
+    document.getElementById("speakBtn").addEventListener("click", () => {
+      speechSynthesis.cancel();
+      const utterance = new SpeechSynthesisUtterance(currentSummaryText);
+      utterance.lang = "hi-IN";
+      speechSynthesis.speak(utterance);
+    });
+  </script>
+</body>
+</html>
