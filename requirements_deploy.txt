@@ -1,6 +1,6 @@
 flask
 flask-cors
 groq
-PyPDF2
+pypdf
 python-dotenv
 gunicorn
