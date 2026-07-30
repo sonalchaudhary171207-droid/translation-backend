@@ -1,70 +1,105 @@
+import json
+import re
+import os
 from flask import Flask, request, jsonify
 from flask_cors import CORS
+from pypdf import PdfReader
 from groq import Groq
-from PyPDF2 import PdfReader
-import os, json
-from dotenv import load_dotenv
 
-load_dotenv()
 app = Flask(__name__)
 CORS(app)
-client = Groq()
 
-@app.route("/", methods=["GET"])
-def home():
-    return jsonify({"status": "live", "message": "Backend is running"}), 200
+# --- CONFIGURATION ---
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
+client = Groq(api_key=GROQ_API_KEY)
 
-@app.route("/process", methods=["POST"])
+def clean_and_parse_json(raw_text):
+    """Safely extracts JSON even if the AI includes extra text or backticks."""
+    cleaned = raw_text.strip()
+    if cleaned.startswith("```"):
+        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
+        cleaned = re.sub(r"\n?```$", "", cleaned)
+    
+    try:
+        return json.loads(cleaned)
+    except json.JSONDecodeError:
+        match = re.search(r'\{.*\}', cleaned, re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise Exception("Failed to parse valid JSON from AI response.")
+
+@app.route('/process', methods=['POST'])
 def process():
-    file = request.files["file"]
-    language = request.form.get("language", "Hindi")
-    path = "temp_" + file.filename
-    file.save(path)
+    try:
+        # 1. Get uploaded file and language from frontend
+        file = request.files.get('file')
+        language = request.form.get('language', 'English')
 
-    filename_lower = file.filename.lower()
+        if not file:
+            return jsonify({"error": "No file uploaded"}), 400
 
-    if filename_lower.endswith(".pdf"):
-        reader = PdfReader(path)
-        text = "".join(page.extract_text() for page in reader.pages)
-    else:
-        os.remove(path)
-        return jsonify({"error": "This deployed version supports PDF files only."}), 400
+        # 2. Extract text from PDF or Plain Text file
+        extracted_text = ""
+        if file.filename.endswith('.pdf'):
+            reader = PdfReader(file)
+            for page in reader.pages:
+                text = page.extract_text()
+                if text:
+                    extracted_text += text + "\n"
+        else:
+            extracted_text = file.read().decode('utf-8', errors='ignore')
 
-    prompt = f"""Summarize the following content for a student in detail. Respond ONLY with valid JSON, no other text, no markdown, in exactly this format:
+        if not extracted_text.strip():
+            return jsonify({"error": "Could not extract text from the provided file."}), 400
 
-{{
-  "headings": {{
-    "overview": "the word 'Overview' translated into {language}",
-    "key_points": "the phrase 'Key Points' translated into {language}",
-    "key_terms": "the phrase 'Key Terms' translated into {language}"
-  }},
-  "overview": "4-5 sentence overview here, in {language}",
-  "key_points": ["point 1", "point 2", "point 3", "point 4", "point 5"],
-  "key_terms": [
-    {{"term": "term name written in {language} script", "definition": "detailed definition in {language}"}}
-  ]
-}}
+        # 3. Construct system and user prompt with JSON enforcement
+        system_instructions = (
+            "You are a study content extractor. You MUST respond strictly with a valid JSON object. "
+            "Do not output markdown block formatting (no ```json)."
+        )
 
-Content:
-{text[:15000]}"""
+        user_prompt = f"""
+        Analyze the following text and explain it in {language}.
+        You MUST return ONLY a valid JSON object matching this exact structure:
 
-    reply = client.chat.completions.create(
-        model="llama-3.1-8b-instant",
-        max_tokens=1500,
-        messages=[{"role": "user", "content": prompt}]
-    )
+        {{
+            "headings": {{
+                "overview": "Overview",
+                "key_points": "Key points",
+                "key_terms": "Key terms"
+            }},
+            "overview": "Summary paragraph here translated to {language}",
+            "key_points": ["Point 1 in {language}", "Point 2 in {language}", "Point 3 in {language}"],
+            "key_terms": [
+                {{"term": "TERM 1", "definition": "Definition 1 in {language}"}},
+                {{"term": "TERM 2", "definition": "Definition 2 in {language}"}}
+            ]
+        }}
 
-    raw = reply.choices[0].message.content.strip()
+        Text to summarize:
+        {extracted_text}
+        """
 
-    if raw.startswith("```"):
-        raw = raw.strip("`")
-        if raw.startswith("json"):
-            raw = raw[4:]
+        # 4. Request summary from Groq (using llama-3.3-70b-versatile for high quality)
+        chat_completion = client.chat.completions.create(
+            messages=[
+                {"role": "system", "content": system_instructions},
+                {"role": "user", "content": user_prompt}
+            ],
+            model="llama-3.3-70b-versatile",
+            response_format={"type": "json_object"}
+        )
 
-    parsed = json.loads(raw)
+        raw_response_text = chat_completion.choices[0].message.content
 
-    os.remove(path)
-    return jsonify(parsed)
+        # 5. Clean and parse JSON
+        parsed_data = clean_and_parse_json(raw_response_text)
 
-if __name__ == "__main__":
-    app.run(debug=True)
+        return jsonify(parsed_data)
+
+    except Exception as e:
+        print("Error during processing:", str(e))
+        return jsonify({"error": str(e)}), 500
+
+if __name__ == '__main__':
+    app.run(host='127.0.0.1', port=5000, debug=True)
