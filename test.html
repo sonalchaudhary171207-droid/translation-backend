@@ -70,7 +70,7 @@
       document.getElementById("result").innerHTML = "Loading...";
       document.getElementById("speakBtn").style.display = "none";
 
-      const res = await fetch("http://localhost:5000/process", {
+      const res = await fetch("https://translation-backend-yedv.onrender.com/process", {
         method: "POST",
         body: formData
       });
