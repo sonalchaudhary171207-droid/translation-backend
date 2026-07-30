@@ -1,105 +1,122 @@
-import json
-import re
 import os
+import io
+import re
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
 from groq import Groq
 
 app = Flask(__name__)
-CORS(app)
 
-# --- CONFIGURATION ---
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "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")
-client = Groq(api_key=GROQ_API_KEY)
+# Allow cross-origin requests from Vercel frontend
+CORS(app, resources={r"/*": {"origins": "*"}})
 
-def clean_and_parse_json(raw_text):
-    """Safely extracts JSON even if the AI includes extra text or backticks."""
-    cleaned = raw_text.strip()
-    if cleaned.startswith("```"):
-        cleaned = re.sub(r"^```[a-zA-Z]*\n?", "", cleaned)
-        cleaned = re.sub(r"\n?```$", "", cleaned)
-    
+# Initialize Groq client
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY")
+client = Groq(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+
+
+def clean_text(text: str) -> str:
+    """Removes excessive whitespace and unwanted special characters from extracted text."""
+    if not text:
+        return ""
+    # Normalize spaces and newlines
+    text = re.sub(r'\s+', ' ', text)
+    return text.strip()
+
+
+@app.route("/", methods=["GET"])
+def health_check():
+    return jsonify({"status": "healthy", "message": "Backend API is running"}), 200
+
+
+@app.route("/summarize", methods=["POST"])
+def summarize():
+    # 1. Verify Groq API Key
+    if not client:
+        return jsonify({"error": "GROQ_API_KEY environment variable is not set on server."}), 500
+
+    # 2. Check if a file was provided in the request
+    if "file" not in request.files:
+        return jsonify({"error": "No file uploaded. Please select a PDF file."}), 400
+
+    file = request.files["file"]
+
+    if file.filename == "":
+        return jsonify({"error": "No file selected."}), 400
+
+    # Read optional target language from form data (default to English)
+    target_language = request.form.get("language", "English")
+
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        match = re.search(r'\{.*\}', cleaned, re.DOTALL)
-        if match:
-            return json.loads(match.group(0))
-        raise Exception("Failed to parse valid JSON from AI response.")
+        # 3. CRITICAL FIX: Reset file pointer to beginning of stream before reading
+        file.seek(0)
+        file_bytes = file.read()
 
-@app.route('/process', methods=['POST'])
-def process():
-    try:
-        # 1. Get uploaded file and language from frontend
-        file = request.files.get('file')
-        language = request.form.get('language', 'English')
+        if len(file_bytes) == 0:
+            return jsonify({"error": "Uploaded file is empty."}), 400
 
-        if not file:
-            return jsonify({"error": "No file uploaded"}), 400
+        # 4. Extract text with PyPDF from in-memory stream
+        pdf_stream = io.BytesIO(file_bytes)
+        reader = PdfReader(pdf_stream)
 
-        # 2. Extract text from PDF or Plain Text file
         extracted_text = ""
-        if file.filename.endswith('.pdf'):
-            reader = PdfReader(file)
-            for page in reader.pages:
-                text = page.extract_text()
-                if text:
-                    extracted_text += text + "\n"
-        else:
-            extracted_text = file.read().decode('utf-8', errors='ignore')
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                extracted_text += page_text + "\n"
 
-        if not extracted_text.strip():
-            return jsonify({"error": "Could not extract text from the provided file."}), 400
+        extracted_text = clean_text(extracted_text)
 
-        # 3. Construct system and user prompt with JSON enforcement
-        system_instructions = (
-            "You are a study content extractor. You MUST respond strictly with a valid JSON object. "
-            "Do not output markdown block formatting (no ```json)."
-        )
+        # 5. Handle scanned or unreadable PDFs
+        if not extracted_text or len(extracted_text) < 5:
+            return jsonify({
+                "error": "Could not extract text from the provided file. Ensure the PDF contains selectable text and is not an image-based scan."
+            }), 400
 
-        user_prompt = f"""
-        Analyze the following text and explain it in {language}.
-        You MUST return ONLY a valid JSON object matching this exact structure:
+        # Truncate input text if it's too long to prevent context token overflow (~10k chars)
+        max_chars = 10000
+        truncated_text = extracted_text[:max_chars]
 
-        {{
-            "headings": {{
-                "overview": "Overview",
-                "key_points": "Key points",
-                "key_terms": "Key terms"
-            }},
-            "overview": "Summary paragraph here translated to {language}",
-            "key_points": ["Point 1 in {language}", "Point 2 in {language}", "Point 3 in {language}"],
-            "key_terms": [
-                {{"term": "TERM 1", "definition": "Definition 1 in {language}"}},
-                {{"term": "TERM 2", "definition": "Definition 2 in {language}"}}
-            ]
-        }}
+        # 6. Call Groq API
+        prompt_message = f"""
+        Analyze the following text and create comprehensive study notes in {target_language}.
+        Include:
+        1. Overview
+        2. Key Points / Takeaways
+        3. Important Vocabulary / Terms
 
-        Text to summarize:
-        {extracted_text}
+        Text content:
+        {truncated_text}
         """
 
-        # 4. Request summary from Groq (using llama-3.3-70b-versatile for high quality)
-        chat_completion = client.chat.completions.create(
-            messages=[
-                {"role": "system", "content": system_instructions},
-                {"role": "user", "content": user_prompt}
-            ],
+        completion = client.chat.completions.create(
             model="llama-3.3-70b-versatile",
-            response_format={"type": "json_object"}
+            messages=[
+                {
+                    "role": "system",
+                    "content": f"You are an expert study assistant. Output all summaries and notes clearly in {target_language}."
+                },
+                {
+                    "role": "user",
+                    "content": prompt_message
+                }
+            ],
+            temperature=0.4,
+            max_tokens=1200,
         )
 
-        raw_response_text = chat_completion.choices[0].message.content
+        summary_result = completion.choices[0].message.content
 
-        # 5. Clean and parse JSON
-        parsed_data = clean_and_parse_json(raw_response_text)
-
-        return jsonify(parsed_data)
+        return jsonify({
+            "success": True,
+            "summary": summary_result
+        }), 200
 
     except Exception as e:
-        print("Error during processing:", str(e))
-        return jsonify({"error": str(e)}), 500
+        return jsonify({"error": f"Server processing error: {str(e)}"}), 500
 
-if __name__ == '__main__':
-    app.run(host='127.0.0.1', port=5000, debug=True)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
