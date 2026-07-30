@@ -1,10 +1,13 @@
 import os
 import io
 import re
+import json
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from pypdf import PdfReader
 from groq import Groq
+import pytesseract
+from pdf2image import convert_from_bytes
 
 app = Flask(__name__)
 
@@ -20,9 +23,40 @@ def clean_text(text: str) -> str:
     """Removes excessive whitespace and unwanted special characters from extracted text."""
     if not text:
         return ""
-    # Normalize spaces and newlines
     text = re.sub(r'\s+', ' ', text)
     return text.strip()
+
+
+def extract_text_from_pdf(file_bytes: bytes) -> str:
+    """Extracts text using PyPDF first; falls back to Tesseract OCR for scanned PDFs."""
+    extracted_text = ""
+
+    # Method 1: PyPDF for selectable text
+    try:
+        pdf_stream = io.BytesIO(file_bytes)
+        reader = PdfReader(pdf_stream)
+        for page in reader.pages:
+            page_text = page.extract_text()
+            if page_text:
+                extracted_text += page_text + "\n"
+    except Exception as e:
+        print(f"PyPDF extraction error: {e}")
+
+    extracted_text = clean_text(extracted_text)
+
+    # Method 2: OCR Fallback if PyPDF extracted little to no text
+    if len(extracted_text) < 15:
+        print("Scanned PDF detected. Running OCR...")
+        try:
+            images = convert_from_bytes(file_bytes)
+            ocr_text = ""
+            for img in images:
+                ocr_text += pytesseract.image_to_string(img) + "\n"
+            extracted_text = clean_text(ocr_text)
+        except Exception as e:
+            print(f"OCR processing error: {e}")
+
+    return extracted_text
 
 
 @app.route("/", methods=["GET"])
@@ -45,48 +79,55 @@ def summarize():
     if file.filename == "":
         return jsonify({"error": "No file selected."}), 400
 
-    # Read optional target language from form data (default to English)
     target_language = request.form.get("language", "English")
 
     try:
-        # 3. CRITICAL FIX: Reset file pointer to beginning of stream before reading
         file.seek(0)
         file_bytes = file.read()
 
         if len(file_bytes) == 0:
             return jsonify({"error": "Uploaded file is empty."}), 400
 
-        # 4. Extract text with PyPDF from in-memory stream
-        pdf_stream = io.BytesIO(file_bytes)
-        reader = PdfReader(pdf_stream)
+        # 3. Extract text (supports both standard and scanned PDFs)
+        extracted_text = extract_text_from_pdf(file_bytes)
 
-        extracted_text = ""
-        for page in reader.pages:
-            page_text = page.extract_text()
-            if page_text:
-                extracted_text += page_text + "\n"
-
-        extracted_text = clean_text(extracted_text)
-
-        # 5. Handle scanned or unreadable PDFs
-        if not extracted_text or len(extracted_text) < 5:
+        if not extracted_text or len(extracted_text) < 10:
             return jsonify({
-                "error": "Could not extract text from the provided file. Ensure the PDF contains selectable text and is not an image-based scan."
+                "error": "Could not extract text from the file even with OCR. Please make sure the PDF image quality is readable."
             }), 400
 
-        # Truncate input text if it's too long to prevent context token overflow (~10k chars)
-        max_chars = 10000
+        # Limit token size for context length
+        max_chars = 12000
         truncated_text = extracted_text[:max_chars]
 
-        # 6. Call Groq API
+        # 4. Prompt Groq for Strict JSON response
         prompt_message = f"""
-        Analyze the following text and create comprehensive study notes in {target_language}.
-        Include:
-        1. Overview
-        2. Key Points / Takeaways
-        3. Important Vocabulary / Terms
+        Analyze the following study material and generate notes in {target_language}.
 
-        Text content:
+        You MUST respond ONLY with a raw, valid JSON object (no markdown formatting, no ```json tags, no additional commentary).
+        Use this exact schema:
+
+        {{
+          "headings": {{
+            "overview": "Overview heading translated to {target_language}",
+            "key_points": "Key Points heading translated to {target_language}",
+            "key_terms": "Key Terms heading translated to {target_language}"
+          }},
+          "overview": "Detailed overview paragraph summarizing the core concepts in {target_language}.",
+          "key_points": [
+            "Key takeaway point 1 in {target_language}",
+            "Key takeaway point 2 in {target_language}",
+            "Key takeaway point 3 in {target_language}"
+          ],
+          "key_terms": [
+            {{
+              "term": "Term Name in {target_language}",
+              "definition": "Definition or explanation in {target_language}"
+            }}
+          ]
+        }}
+
+        Source text:
         {truncated_text}
         """
 
@@ -95,25 +136,33 @@ def summarize():
             messages=[
                 {
                     "role": "system",
-                    "content": f"You are an expert study assistant. Output all summaries and notes clearly in {target_language}."
+                    "content": f"You are a helpful study assistant. Output strictly valid JSON in {target_language} matching the requested structure."
                 },
                 {
                     "role": "user",
                     "content": prompt_message
                 }
             ],
-            temperature=0.4,
-            max_tokens=1200,
+            temperature=0.3,
+            max_tokens=1500,
         )
 
-        summary_result = completion.choices[0].message.content
+        raw_response = completion.choices[0].message.content.strip()
 
-        return jsonify({
-            "success": True,
-            "summary": summary_result
-        }), 200
+        # Clean JSON if any backticks leaked in
+        if raw_response.startswith("```json"):
+            raw_response = raw_response[7:]
+        if raw_response.startswith("```"):
+            raw_response = raw_response[3:]
+        if raw_response.endswith("```"):
+            raw_response = raw_response[:-3]
+        raw_response = raw_response.strip()
+
+        parsed_json = json.loads(raw_response)
+        return jsonify(parsed_json), 200
 
     except Exception as e:
+        print("Server error:", str(e))
         return jsonify({"error": f"Server processing error: {str(e)}"}), 500
 
 
